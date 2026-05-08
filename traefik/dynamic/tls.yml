@@ -1,0 +1,24 @@
+tls:
+  # Default certificate loaded from the ./certs/ directory mounted by docker-compose.onprem.yml.
+  # Replace cert.pem / key.pem with your own certificate before starting.
+  # See docs/on-premise/tls.md for instructions on generating or importing certs.
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/cert.pem
+        keyFile: /certs/key.pem
+
+  options:
+    default:
+      minVersion: VersionTLS12
+      cipherSuites:
+        - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+        - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+      sniStrict: false
+      curvePreferences:
+        - CurveP521
+        - CurveP384
