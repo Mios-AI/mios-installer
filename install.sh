@@ -171,7 +171,7 @@ setup_env() {
   # ── Interactive prompts ──
   read_input() {
     local prompt="$1" default="$2" value
-    read -rp "   ${prompt} [${default}]: " value
+    read -rp "   ${prompt} [${default}]: " value </dev/tty
     echo "${value:-$default}"
   }
 
