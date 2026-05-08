@@ -431,10 +431,13 @@ services:
 networks:
   mios-frontend:
     driver: bridge
+    name: mios-frontend
   mios-backend:
     driver: bridge
+    name: mios-backend
   mios-database:
     driver: bridge
+    name: mios-database
     internal: true
 
 # ─── Volumes ──────────────────────────────────────────────────────────────────
