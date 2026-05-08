@@ -355,7 +355,7 @@ services:
     networks:
       - mios-backend
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      test: ["CMD-SHELL", "bun -e \"fetch('http://localhost:3000/health').then(r=>r.ok||process.exit(1)).catch(()=>process.exit(1))\""]
       <<: *healthcheck
 
   app-conn-github:
@@ -378,7 +378,7 @@ services:
     networks:
       - mios-backend
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      test: ["CMD-SHELL", "bun -e \"fetch('http://localhost:3000/health').then(r=>r.ok||process.exit(1)).catch(()=>process.exit(1))\""]
       <<: *healthcheck
 
   app-conn-microsoft:
@@ -401,7 +401,7 @@ services:
     networks:
       - mios-backend
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      test: ["CMD-SHELL", "bun -e \"fetch('http://localhost:3000/health').then(r=>r.ok||process.exit(1)).catch(()=>process.exit(1))\""]
       <<: *healthcheck
 
   app-conn-google:
@@ -424,7 +424,7 @@ services:
     networks:
       - mios-backend
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      test: ["CMD-SHELL", "bun -e \"fetch('http://localhost:3000/health').then(r=>r.ok||process.exit(1)).catch(()=>process.exit(1))\""]
       <<: *healthcheck
 
 # ─── Networks ─────────────────────────────────────────────────────────────────

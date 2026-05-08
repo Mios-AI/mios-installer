@@ -447,7 +447,7 @@ run_health_checks() {
     local container="mios-${c}"
     printf "   Waiting for %-25s" "${name} connector..."
     local elapsed=0
-    until docker exec "${container}" wget -qO- http://localhost:3000/health > /dev/null 2>&1; do
+    until docker exec "${container}" bun -e "fetch('http://localhost:3000/health').then(r=>r.ok||process.exit(1)).catch(()=>process.exit(1))" > /dev/null 2>&1; do
       if [ "${elapsed}" -ge "${HEALTH_TIMEOUT}" ]; then
         echo -e " ${RED}TIMEOUT${RESET}"
         warn "${name} connector did not become healthy within ${HEALTH_TIMEOUT}s"
