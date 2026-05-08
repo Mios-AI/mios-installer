@@ -2,9 +2,9 @@
 # MIOS On-Premise Installer
 #
 # Usage:
-#   ./install.sh                         # interactive setup
+#   ./install.sh                         # interactive setup (prompts for domain + connectors)
 #   ./install.sh --env-file /path/.env   # non-interactive with existing env file
-#   ./install.sh --with-connectors       # also start optional connector services
+#   ./install.sh --with-connectors       # start all connectors without interactive prompt
 #   ./install.sh --skip-pull             # skip docker image pull (air-gapped)
 #   ./install.sh --help
 
@@ -25,6 +25,10 @@ readonly HEALTH_TIMEOUT=120
 OPT_ENV_FILE=""
 OPT_WITH_CONNECTORS=false
 OPT_SKIP_PULL=false
+
+# ─── Connector state ──────────────────────────────────────────────────────────
+SELECTED_CONNECTORS=()
+readonly AVAILABLE_CONNECTORS=("slack" "github" "microsoft" "google")
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -60,9 +64,11 @@ Usage: $(basename "$0") [OPTIONS]
 
 Options:
   --env-file PATH      Use an existing .env file instead of the interactive setup
-  --with-connectors    Also start Slack, GitHub, Microsoft and Google connectors
+  --with-connectors    Start all connectors without interactive selection prompt
   --skip-pull          Skip docker image pull (for air-gapped environments)
   --help               Show this help message
+
+Connector setup guide: https://docs.mios-ai.com/docs/on-premise/connectors
 EOF
   exit 0
 }
@@ -205,6 +211,79 @@ setup_env() {
   success ".env created at ${ENV_FILE}"
 }
 
+# ─── Connector selection ──────────────────────────────────────────────────────
+select_connectors_interactive() {
+  # --with-connectors flag: select all without showing UI
+  if [ "${OPT_WITH_CONNECTORS}" = true ]; then
+    for c in "${AVAILABLE_CONNECTORS[@]}"; do
+      SELECTED_CONNECTORS+=("app-conn-${c}")
+    done
+    success "All connectors selected"
+    return
+  fi
+
+  # --env-file mode: no interactive prompt
+  if [ -n "${OPT_ENV_FILE}" ]; then
+    return
+  fi
+
+  local selected=()
+  for i in "${!AVAILABLE_CONNECTORS[@]}"; do selected[i]=0; done
+  local cursor=0
+
+  trap "tput cnorm 2>/dev/null >&2; echo >&2; exit 130" SIGINT
+
+  tput civis 2>/dev/null >&2 || true
+
+  _draw_connector_menu() {
+    clear >&2
+    echo -e "${BOLD}Select connectors to install:${RESET}" >&2
+    echo -e "   ${BLUE}Space${RESET} to toggle · ${BLUE}↑ ↓${RESET} to move · ${BLUE}Enter${RESET} to confirm\n" >&2
+    for i in "${!AVAILABLE_CONNECTORS[@]}"; do
+      local prefix="  " ul=""
+      [ "$i" -eq "$cursor" ] && prefix="${BOLD}>${RESET} " && ul="\033[4m"
+      if [ "${selected[i]}" -eq 1 ]; then
+        echo -e "${prefix}${GREEN}${ul}[x] ${AVAILABLE_CONNECTORS[i]}${RESET}" >&2
+      else
+        echo -e "${prefix}${ul}[ ] ${AVAILABLE_CONNECTORS[i]}${RESET}" >&2
+      fi
+    done
+    echo >&2
+    echo -e "   ${YELLOW}Note:${RESET} Connectors require OAuth credentials in .env before connecting." >&2
+    echo -e "   Setup guide: https://docs.mios-ai.com/docs/on-premise/connectors" >&2
+  }
+
+  while true; do
+    _draw_connector_menu
+    IFS= read -rsn1 key </dev/tty
+    if [[ "$key" == $'\x1b' ]]; then
+      read -rsn2 -t 1 seq </dev/tty 2>/dev/null || true
+      case "$seq" in
+        "[A"|"OA") ((cursor--)); [ "$cursor" -lt 0 ] && cursor=$(( ${#AVAILABLE_CONNECTORS[@]} - 1 )) ;;
+        "[B"|"OB") ((cursor++)); [ "$cursor" -ge "${#AVAILABLE_CONNECTORS[@]}" ] && cursor=0 ;;
+      esac
+    elif [[ "$key" == " " ]]; then
+      selected[cursor]=$(( 1 - selected[cursor] ))
+    elif [[ "$key" == "" ]]; then
+      break
+    fi
+  done
+
+  tput cnorm 2>/dev/null >&2 || true
+  clear >&2
+  trap cleanup EXIT
+
+  for i in "${!AVAILABLE_CONNECTORS[@]}"; do
+    [ "${selected[i]}" -eq 1 ] && SELECTED_CONNECTORS+=("app-conn-${AVAILABLE_CONNECTORS[i]}")
+  done
+
+  if [ "${#SELECTED_CONNECTORS[@]}" -gt 0 ]; then
+    success "Selected connectors: $(IFS=', '; echo "${SELECTED_CONNECTORS[*]/#app-conn-/}")"
+  else
+    info "No connectors selected — add them later with: docker compose --profile connectors up -d"
+  fi
+}
+
 # ─── Hosts entries ────────────────────────────────────────────────────────────
 setup_hosts() {
   local domain
@@ -258,9 +337,10 @@ pull_images() {
 
   step "Pulling Docker images"
   local compose_args=(-f "${COMPOSE_FILE}" --env-file "${ENV_FILE}")
-  [ "${OPT_WITH_CONNECTORS}" = true ] && compose_args+=(--profile connectors)
-
   docker compose "${compose_args[@]}" pull --quiet
+  if [ "${#SELECTED_CONNECTORS[@]}" -gt 0 ]; then
+    docker compose "${compose_args[@]}" pull --quiet "${SELECTED_CONNECTORS[@]}"
+  fi
   success "Images pulled"
 }
 
@@ -280,9 +360,7 @@ run_migrations() {
 start_services() {
   step "Starting services"
   local compose_args=(-f "${COMPOSE_FILE}" --env-file "${ENV_FILE}")
-  [ "${OPT_WITH_CONNECTORS}" = true ] && compose_args+=(--profile connectors)
-
-  docker compose "${compose_args[@]}" up -d --remove-orphans
+  docker compose "${compose_args[@]}" up -d --remove-orphans "${SELECTED_CONNECTORS[@]}"
   success "Services started"
 }
 
@@ -314,6 +392,10 @@ run_health_checks() {
   wait_healthy "Frontend app" "https://app.${domain}"        || true
   wait_healthy "AI service"   "https://ai.${domain}/health"  || true
   wait_healthy "Chatbot"      "https://chatbot.${domain}/health" || true
+  for c in "${SELECTED_CONNECTORS[@]}"; do
+    local name="${c#app-conn-}"
+    wait_healthy "${name} connector" "https://${name}.${domain}/health" || true
+  done
 }
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
@@ -330,6 +412,14 @@ print_summary() {
   echo -e "  ${BOLD}API${RESET}          → https://api.${domain}"
   echo -e "  ${BOLD}AI service${RESET}   → https://ai.${domain}"
   echo -e "  ${BOLD}Storage${RESET}      → https://minio.${domain}"
+  if [ "${#SELECTED_CONNECTORS[@]}" -gt 0 ]; then
+    echo
+    echo -e "  ${BOLD}Connectors${RESET}"
+    for c in "${SELECTED_CONNECTORS[@]}"; do
+      local name="${c#app-conn-}"
+      echo -e "    ${name}      → https://${name}.${domain}"
+    done
+  fi
   echo
   echo -e "  ${YELLOW}Note:${RESET} If you used a self-signed certificate, add ./certs/cert.pem"
   echo -e "        to your system's trusted certificate store."
@@ -370,6 +460,7 @@ main() {
   bootstrap
   check_prerequisites
   setup_env
+  select_connectors_interactive
   # shellcheck source=/dev/null
   source "${ENV_FILE}" 2>/dev/null || true
   check_ports
