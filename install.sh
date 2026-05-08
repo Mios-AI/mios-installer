@@ -444,7 +444,7 @@ run_health_checks() {
   wait_healthy "Chatbot"      "https://chatbot.${domain}/health" || true
   for c in "${CONNECTORS_TO_START[@]}"; do
     local name="${c#app-conn-}"
-    local container="${COMPOSE_PROJECT_NAME:-mios}-${c}-1"
+    local container="mios-${c}"
     printf "   Waiting for %-25s" "${name} connector..."
     local elapsed=0
     until docker exec "${container}" curl -sf http://localhost:3000/health > /dev/null 2>&1; do
