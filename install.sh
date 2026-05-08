@@ -444,7 +444,20 @@ run_health_checks() {
   wait_healthy "Chatbot"      "https://chatbot.${domain}/health" || true
   for c in "${CONNECTORS_TO_START[@]}"; do
     local name="${c#app-conn-}"
-    wait_healthy "${name} connector" "https://${name}.${domain}/health" || true
+    local container="${COMPOSE_PROJECT_NAME:-mios}-${c}-1"
+    printf "   Waiting for %-25s" "${name} connector..."
+    local elapsed=0
+    until docker exec "${container}" curl -sf http://localhost:3000/health > /dev/null 2>&1; do
+      if [ "${elapsed}" -ge "${HEALTH_TIMEOUT}" ]; then
+        echo -e " ${RED}TIMEOUT${RESET}"
+        warn "${name} connector did not become healthy within ${HEALTH_TIMEOUT}s"
+        break
+      fi
+      sleep 3
+      elapsed=$((elapsed + 3))
+      printf "."
+    done
+    [ "${elapsed}" -lt "${HEALTH_TIMEOUT}" ] && echo -e " ${GREEN}OK${RESET}" || true
   done
 }
 
