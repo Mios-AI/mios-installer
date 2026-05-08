@@ -259,8 +259,8 @@ select_connectors_interactive() {
     if [[ "$key" == $'\x1b' ]]; then
       read -rsn2 -t 1 seq </dev/tty 2>/dev/null || true
       case "$seq" in
-        "[A"|"OA") ((cursor--)); [ "$cursor" -lt 0 ] && cursor=$(( ${#AVAILABLE_CONNECTORS[@]} - 1 )) ;;
-        "[B"|"OB") ((cursor++)); [ "$cursor" -ge "${#AVAILABLE_CONNECTORS[@]}" ] && cursor=0 ;;
+        "[A"|"OA") cursor=$(( cursor - 1 )); [ "$cursor" -lt 0 ] && cursor=$(( ${#AVAILABLE_CONNECTORS[@]} - 1 )) ;;
+        "[B"|"OB") cursor=$(( cursor + 1 )); [ "$cursor" -ge "${#AVAILABLE_CONNECTORS[@]}" ] && cursor=0 ;;
       esac
     elif [[ "$key" == " " ]]; then
       selected[cursor]=$(( 1 - selected[cursor] ))
