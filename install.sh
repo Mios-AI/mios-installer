@@ -461,6 +461,53 @@ run_health_checks() {
   done
 }
 
+# ─── Trust certificate ────────────────────────────────────────────────────────
+trust_certificate() {
+  local cert="${SCRIPT_DIR}/certs/cert.pem"
+  [ -f "${cert}" ] || return
+
+  # Only offer for self-signed certs (issuer == subject)
+  local subject issuer
+  subject=$(openssl x509 -in "${cert}" -noout -subject 2>/dev/null | sed 's/subject=//')
+  issuer=$(openssl x509 -in "${cert}" -noout -issuer 2>/dev/null | sed 's/issuer=//')
+  [ "${subject}" = "${issuer}" ] || return
+
+  echo
+  local answer
+  read -rp "   Install self-signed certificate into system trust store? [y/N] " answer </dev/tty
+  answer="${answer:-N}"
+  [[ "${answer}" =~ ^[Yy]$ ]] || return
+
+  step "Installing certificate"
+
+  if command -v update-ca-trust &>/dev/null; then
+    sudo cp "${cert}" /etc/pki/ca-trust/source/anchors/mios-local.pem
+    sudo update-ca-trust
+    success "Certificate added to system trust store (Fedora/RHEL)"
+  elif command -v update-ca-certificates &>/dev/null; then
+    sudo cp "${cert}" /usr/local/share/ca-certificates/mios-local.crt
+    sudo update-ca-certificates
+    success "Certificate added to system trust store (Debian/Ubuntu)"
+  elif [[ "$(uname)" == "Darwin" ]]; then
+    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "${cert}"
+    success "Certificate added to macOS Keychain"
+  else
+    warn "Unknown OS — add ${cert} manually to your trust store."
+    return
+  fi
+
+  # Also import into Firefox if certutil is available
+  if command -v certutil &>/dev/null; then
+    local added=false
+    while IFS= read -r db; do
+      certutil -A -n "mios-local" -t "CT,," -i "${cert}" -d "sql:${db}" 2>/dev/null && added=true
+    done < <(find "${HOME}/.mozilla/firefox" -name "cert9.db" -exec dirname {} \; 2>/dev/null)
+    [ "${added}" = true ] && success "Certificate also added to Firefox"
+  else
+    info "Install nss-tools (certutil) to also import into Firefox automatically."
+  fi
+}
+
 # ─── Summary ──────────────────────────────────────────────────────────────────
 print_summary() {
   local domain
@@ -497,9 +544,6 @@ print_summary() {
       echo -e "             $(_connector_doc_url "$name")"
     done
   fi
-  echo
-  echo -e "  ${YELLOW}Note:${RESET} If you used a self-signed certificate, add ./certs/cert.pem"
-  echo -e "        to your system's trusted certificate store."
   echo
   echo -e "  Logs:    docker compose -f docker-compose.onprem.yml logs -f"
   echo -e "  Upgrade: ./upgrade.sh"
@@ -547,6 +591,7 @@ main() {
   check_connector_credentials
   start_services
   run_health_checks
+  trust_certificate
   print_summary
 }
 
