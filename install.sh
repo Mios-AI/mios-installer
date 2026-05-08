@@ -28,6 +28,7 @@ OPT_SKIP_PULL=false
 
 # ─── Connector state ──────────────────────────────────────────────────────────
 SELECTED_CONNECTORS=()
+CONNECTORS_TO_START=()
 readonly AVAILABLE_CONNECTORS=("slack" "github" "microsoft" "google")
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
@@ -280,8 +281,54 @@ select_connectors_interactive() {
   if [ "${#SELECTED_CONNECTORS[@]}" -gt 0 ]; then
     success "Selected connectors: $(IFS=', '; echo "${SELECTED_CONNECTORS[*]/#app-conn-/}")"
   else
-    info "No connectors selected — add them later with: docker compose --profile connectors up -d"
+    info "No connectors selected — rerun install.sh to add them later"
   fi
+}
+
+# ─── Connector credential check ───────────────────────────────────────────────
+_connector_env_valid() {
+  local var
+  for var in "$@"; do
+    local val
+    val=$(grep "^${var}=" "${ENV_FILE}" 2>/dev/null | cut -d= -f2- | tr -d '"')
+    if [ -z "$val" ] || [[ "$val" == *"<CHANGE_ME>"* ]]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+_connector_doc_url() {
+  case "$1" in
+    slack)     echo "https://docs.mios-ai.com/docs/on-premise/connectors#slack" ;;
+    github)    echo "https://docs.mios-ai.com/docs/on-premise/connectors#github" ;;
+    microsoft) echo "https://docs.mios-ai.com/docs/on-premise/connectors#microsoft-365" ;;
+    google)    echo "https://docs.mios-ai.com/docs/on-premise/connectors#google-workspace" ;;
+  esac
+}
+
+check_connector_credentials() {
+  [ "${#SELECTED_CONNECTORS[@]}" -eq 0 ] && return
+
+  step "Checking connector credentials"
+  for c in "${SELECTED_CONNECTORS[@]}"; do
+    local name="${c#app-conn-}"
+    local ready=true
+    case "$name" in
+      slack)     _connector_env_valid SLACK_BOT_TOKEN SLACK_CLIENT_ID SLACK_CLIENT_SECRET SLACK_SIGNING_SECRET || ready=false ;;
+      github)    _connector_env_valid GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET || ready=false ;;
+      microsoft) _connector_env_valid MICROSOFT_CLIENT_ID MICROSOFT_CLIENT_SECRET || ready=false ;;
+      google)    _connector_env_valid GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET || ready=false ;;
+    esac
+
+    if [ "$ready" = true ]; then
+      success "${name}: credentials found — will start"
+      CONNECTORS_TO_START+=("$c")
+    else
+      warn "${name}: credentials missing in .env — skipping"
+      info "  Setup guide: $(_connector_doc_url "$name")"
+    fi
+  done
 }
 
 # ─── Hosts entries ────────────────────────────────────────────────────────────
@@ -360,7 +407,10 @@ run_migrations() {
 start_services() {
   step "Starting services"
   local compose_args=(-f "${COMPOSE_FILE}" --env-file "${ENV_FILE}")
-  docker compose "${compose_args[@]}" up -d --remove-orphans "${SELECTED_CONNECTORS[@]}"
+  docker compose "${compose_args[@]}" up -d --remove-orphans
+  if [ "${#CONNECTORS_TO_START[@]}" -gt 0 ]; then
+    docker compose "${compose_args[@]}" up -d "${CONNECTORS_TO_START[@]}"
+  fi
   success "Services started"
 }
 
@@ -392,7 +442,7 @@ run_health_checks() {
   wait_healthy "Frontend app" "https://app.${domain}"        || true
   wait_healthy "AI service"   "https://ai.${domain}/health"  || true
   wait_healthy "Chatbot"      "https://chatbot.${domain}/health" || true
-  for c in "${SELECTED_CONNECTORS[@]}"; do
+  for c in "${CONNECTORS_TO_START[@]}"; do
     local name="${c#app-conn-}"
     wait_healthy "${name} connector" "https://${name}.${domain}/health" || true
   done
@@ -412,12 +462,26 @@ print_summary() {
   echo -e "  ${BOLD}API${RESET}          → https://api.${domain}"
   echo -e "  ${BOLD}AI service${RESET}   → https://ai.${domain}"
   echo -e "  ${BOLD}Storage${RESET}      → https://minio.${domain}"
-  if [ "${#SELECTED_CONNECTORS[@]}" -gt 0 ]; then
+  if [ "${#CONNECTORS_TO_START[@]}" -gt 0 ]; then
     echo
     echo -e "  ${BOLD}Connectors${RESET}"
-    for c in "${SELECTED_CONNECTORS[@]}"; do
+    for c in "${CONNECTORS_TO_START[@]}"; do
       local name="${c#app-conn-}"
       echo -e "    ${name}      → https://${name}.${domain}"
+    done
+  fi
+  local pending=()
+  for c in "${SELECTED_CONNECTORS[@]}"; do
+    local found=false
+    for s in "${CONNECTORS_TO_START[@]}"; do [ "$c" = "$s" ] && found=true && break; done
+    [ "$found" = false ] && pending+=("${c#app-conn-}")
+  done
+  if [ "${#pending[@]}" -gt 0 ]; then
+    echo
+    echo -e "  ${YELLOW}Connectors pending setup:${RESET}"
+    for name in "${pending[@]}"; do
+      echo -e "    ${name}  → fill credentials in .env then rerun ./install.sh"
+      echo -e "             $(_connector_doc_url "$name")"
     done
   fi
   echo
@@ -467,6 +531,7 @@ main() {
   setup_tls
   setup_hosts
   pull_images
+  check_connector_credentials
   start_services
   run_health_checks
   print_summary
