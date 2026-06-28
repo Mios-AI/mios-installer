@@ -701,6 +701,7 @@ bootstrap() {
   for f in "${files[@]}"; do
     curl -fsSL "${INSTALLER_URL}/${f}" -o "${SCRIPT_DIR}/${f}"
   done
+  chmod +x "${SCRIPT_DIR}/keycloak/entrypoint.sh"
   success "Installer files ready"
 }
 

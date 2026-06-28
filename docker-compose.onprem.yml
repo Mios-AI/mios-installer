@@ -452,7 +452,7 @@ services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
     container_name: mios-keycloak
-    entrypoint: ["/opt/keycloak/entrypoint.sh"]
+    entrypoint: ["bash", "/opt/keycloak/entrypoint.sh"]
     command: ["start", "--import-realm"]
     environment:
       KC_DB: postgres
