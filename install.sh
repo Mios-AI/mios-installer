@@ -25,6 +25,8 @@ readonly HEALTH_TIMEOUT=120
 OPT_ENV_FILE=""
 OPT_WITH_CONNECTORS=false
 OPT_SKIP_PULL=false
+OPT_AIRGAP=false
+OPT_BUNDLE_DIR=""
 
 # ─── Connector state ──────────────────────────────────────────────────────────
 SELECTED_CONNECTORS=()
@@ -67,6 +69,9 @@ Options:
   --env-file PATH      Use an existing .env file instead of the interactive setup
   --with-connectors    Start all connectors without interactive selection prompt
   --skip-pull          Skip docker image pull (for air-gapped environments)
+  --airgap             Fully offline install: load images + Ollama model from the
+                       bundle and skip all network pulls (implies --skip-pull)
+  --bundle DIR         Directory holding the air-gap bundle (default: install dir)
   --help               Show this help message
 
 Connector setup guide: https://docs.mios-ai.com/docs/on-premise/connectors
@@ -79,6 +84,8 @@ while [[ $# -gt 0 ]]; do
     --env-file)        OPT_ENV_FILE="$2"; shift 2 ;;
     --with-connectors) OPT_WITH_CONNECTORS=true; shift ;;
     --skip-pull)       OPT_SKIP_PULL=true; shift ;;
+    --airgap)          OPT_AIRGAP=true; OPT_SKIP_PULL=true; shift ;;
+    --bundle)          OPT_BUNDLE_DIR="$2"; shift 2 ;;
     --help|-h)         usage ;;
     *) error "Unknown option: $1. Use --help for usage." ;;
   esac
@@ -203,6 +210,10 @@ setup_env() {
     sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=$(generate_secret)|" "${ENV_FILE}"
     sed -i "s|^MINIO_ROOT_PASSWORD=.*|MINIO_ROOT_PASSWORD=$(generate_secret)|" "${ENV_FILE}"
     sed -i "s|^INTERNAL_API_KEY=.*|INTERNAL_API_KEY=$(generate_secret)|" "${ENV_FILE}"
+    sed -i "s|^KEYCLOAK_ADMIN_PASSWORD=.*|KEYCLOAK_ADMIN_PASSWORD=$(generate_secret)|" "${ENV_FILE}"
+    sed -i "s|^KEYCLOAK_DB_PASSWORD=.*|KEYCLOAK_DB_PASSWORD=$(generate_secret)|" "${ENV_FILE}"
+    sed -i "s|^KEYCLOAK_CLIENT_SECRET=.*|KEYCLOAK_CLIENT_SECRET=$(generate_secret)|" "${ENV_FILE}"
+    sed -i "s|^NEXTAUTH_SECRET=.*|NEXTAUTH_SECRET=$(generate_secret)|" "${ENV_FILE}"
     success "Secrets generated"
   fi
 
@@ -210,6 +221,43 @@ setup_env() {
   sed -i "s|\${DOMAIN_NAME}|${domain}|g" "${ENV_FILE}"
 
   success ".env created at ${ENV_FILE}"
+}
+
+# ─── License setup ────────────────────────────────────────────────────────────
+readonly LICENSE_DIR="${SCRIPT_DIR}/license"
+readonly LICENSE_FILE="${LICENSE_DIR}/mios.license"
+
+generate_instance_id() {
+  uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16
+}
+
+setup_license() {
+  step "License setup"
+  mkdir -p "${LICENSE_DIR}"
+
+  # Instance ID — generated once, ties the license to this installation.
+  if ! grep -q "^MIOS_INSTANCE_ID=.\+" "${ENV_FILE}" 2>/dev/null; then
+    local instance_id
+    instance_id=$(generate_instance_id)
+    if grep -q "^MIOS_INSTANCE_ID=" "${ENV_FILE}" 2>/dev/null; then
+      sed -i "s|^MIOS_INSTANCE_ID=.*|MIOS_INSTANCE_ID=${instance_id}|" "${ENV_FILE}"
+    else
+      printf '\n# Unique installation ID — required to issue your Mios license\nMIOS_INSTANCE_ID=%s\n' "${instance_id}" >> "${ENV_FILE}"
+    fi
+    success "Instance ID generated: ${instance_id}"
+  fi
+
+  if [ -f "${LICENSE_FILE}" ]; then
+    success "License file found: ${LICENSE_FILE}"
+  else
+    local instance_id
+    instance_id=$(grep "^MIOS_INSTANCE_ID=" "${ENV_FILE}" | cut -d= -f2)
+    warn "No license file found at ${LICENSE_FILE}"
+    echo -e "   Send this instance ID to your Mios contact to receive your license:" >&2
+    echo -e "   ${BOLD}${instance_id}${RESET}" >&2
+    echo -e "   Then place the received file at ./license/mios.license (picked up within 60s)." >&2
+    echo -e "   Until then the API stays locked (only /health and /license respond)." >&2
+  fi
 }
 
 # ─── Connector selection ──────────────────────────────────────────────────────
@@ -391,6 +439,56 @@ pull_images() {
   success "Images pulled"
 }
 
+# ─── Air-gapped image + model loading ─────────────────────────────────────────
+_bundle_dir() { echo "${OPT_BUNDLE_DIR:-${SCRIPT_DIR}}"; }
+
+load_images() {
+  [ "${OPT_AIRGAP}" = true ] || return 0
+
+  step "Loading container images from bundle (air-gapped)"
+  local dir; dir="$(_bundle_dir)"
+  shopt -s nullglob
+  local parts=("${dir}"/mios-*-images.tar.gz.part*)
+  local single=("${dir}"/mios-*-images.tar.gz)
+  shopt -u nullglob
+
+  if [ "${#parts[@]}" -gt 0 ]; then
+    info "Loading ${#parts[@]} image part(s) from ${dir}..."
+    cat "${parts[@]}" | docker load | sed 's/^/   /'
+  elif [ "${#single[@]}" -gt 0 ]; then
+    info "Loading $(basename "${single[0]}")..."
+    docker load -i "${single[0]}" | sed 's/^/   /'
+  else
+    error "No image bundle found in ${dir} (expected mios-*-images.tar.gz[.part*]). Use --bundle DIR."
+  fi
+  success "Images loaded into the local Docker engine"
+}
+
+load_ollama_model() {
+  [ "${OPT_AIRGAP}" = true ] || return 0
+
+  local dir; dir="$(_bundle_dir)"
+  shopt -s nullglob
+  local parts=("${dir}"/mios-*-ollama-*.tar.gz.part*)
+  local single=("${dir}"/mios-*-ollama-*.tar.gz)
+  shopt -u nullglob
+
+  if [ "${#parts[@]}" -eq 0 ] && [ "${#single[@]}" -eq 0 ]; then
+    warn "No Ollama model bundle found in ${dir} — local AI inference unavailable until a model is loaded."
+    return
+  fi
+
+  step "Restoring Ollama model into volume (air-gapped)"
+  docker volume create mios_ollama_models >/dev/null
+  # busybox ships in the image bundle and provides tar for the restore.
+  if [ "${#parts[@]}" -gt 0 ]; then
+    cat "${parts[@]}" | docker run --rm -i -v mios_ollama_models:/data busybox tar -xzf - -C /data
+  else
+    docker run --rm -i -v mios_ollama_models:/data busybox tar -xzf - -C /data < "${single[0]}"
+  fi
+  success "Ollama model restored into mios_ollama_models"
+}
+
 # ─── Database migrations ──────────────────────────────────────────────────────
 run_migrations() {
   step "Running database migrations"
@@ -407,6 +505,7 @@ run_migrations() {
 start_services() {
   step "Starting services"
   local compose_args=(-f "${COMPOSE_FILE}" --env-file "${ENV_FILE}")
+  [ "${OPT_AIRGAP}" = true ] && export MIOS_PULL_POLICY=never
   docker compose "${compose_args[@]}" up -d --remove-orphans
   if [ "${#CONNECTORS_TO_START[@]}" -gt 0 ]; then
     docker compose "${compose_args[@]}" up -d "${CONNECTORS_TO_START[@]}"
@@ -433,15 +532,37 @@ wait_healthy() {
   echo -e " ${GREEN}OK${RESET}"
 }
 
+wait_ai() {
+  local url="$1" elapsed=0 ai_model
+  ai_model=$(grep "^AI_MODEL=" "${ENV_FILE}" | cut -d= -f2 | tr -d '"' || true)
+
+  printf "   Waiting for %-25s" "AI service..."
+  until curl -sfk --max-time 3 "${url}" > /dev/null 2>&1; do
+    if [ "${elapsed}" -ge "${HEALTH_TIMEOUT}" ]; then
+      echo -e " ${YELLOW}preparing${RESET}"
+      info "On first boot the AI service downloads its model${ai_model:+ (${ai_model})}; this can take several minutes and continues in the background."
+      info "Follow it with: docker compose -f docker-compose.onprem.yml logs -f app-ai"
+      return 0
+    fi
+    sleep 3
+    elapsed=$((elapsed + 3))
+    printf "."
+  done
+  echo -e " ${GREEN}OK${RESET}"
+}
+
 run_health_checks() {
   step "Health checks"
   local domain
   domain=$(grep "^DOMAIN_NAME=" "${ENV_FILE}" | cut -d= -f2 | tr -d '"' || echo "mios.local")
+  local https_port port_suffix=""
+  https_port=$(grep "^HTTPS_PORT=" "${ENV_FILE}" | cut -d= -f2 | tr -d '"')
+  [ -n "${https_port}" ] && [ "${https_port}" != "443" ] && port_suffix=":${https_port}"
 
-  wait_healthy "API backend"  "https://api.${domain}/health" || true
-  wait_healthy "Frontend app" "https://app.${domain}"        || true
-  wait_healthy "AI service"   "https://ai.${domain}/health"  || true
-  wait_healthy "Chatbot"      "https://chatbot.${domain}/health" || true
+  wait_healthy "API backend"  "https://api.${domain}${port_suffix}/health" || true
+  wait_healthy "Frontend app" "https://app.${domain}${port_suffix}"        || true
+  wait_ai      "https://ai.${domain}${port_suffix}/health"                 || true
+  wait_healthy "Chatbot"      "https://chatbot.${domain}${port_suffix}/health" || true
   for c in "${CONNECTORS_TO_START[@]}"; do
     local name="${c#app-conn-}"
     local container="mios-${c}"
@@ -545,6 +666,13 @@ print_summary() {
     done
   fi
   echo
+  if [ ! -f "${LICENSE_FILE}" ]; then
+    local instance_id
+    instance_id=$(grep "^MIOS_INSTANCE_ID=" "${ENV_FILE}" | cut -d= -f2 || true)
+    echo -e "  ${YELLOW}License missing — the API is locked until ./license/mios.license is installed.${RESET}"
+    echo -e "  Instance ID to send to Mios: ${BOLD}${instance_id}${RESET}"
+    echo
+  fi
   echo -e "  Logs:    docker compose -f docker-compose.onprem.yml logs -f"
   echo -e "  Upgrade: ./upgrade.sh"
   echo
@@ -552,10 +680,14 @@ print_summary() {
 
 # ─── Bootstrap — download required files if missing (curl | bash mode) ───────
 bootstrap() {
+  # Air-gapped installs ship every file in the bundle — never reach out to GitHub.
+  [ "${OPT_AIRGAP}" = true ] && return
   local files=(
     "docker-compose.onprem.yml"
     "traefik/dynamic/tls.yml"
     "traefik/dynamic/middlewares.yml"
+    "keycloak/realm-export.prod.json"
+    "keycloak/entrypoint.sh"
     ".env.example"
   )
   local missing=false
@@ -565,7 +697,7 @@ bootstrap() {
   [[ "$missing" == "false" ]] && return
 
   step "Downloading installer files..."
-  mkdir -p "${SCRIPT_DIR}/traefik/dynamic"
+  mkdir -p "${SCRIPT_DIR}/traefik/dynamic" "${SCRIPT_DIR}/keycloak"
   for f in "${files[@]}"; do
     curl -fsSL "${INSTALLER_URL}/${f}" -o "${SCRIPT_DIR}/${f}"
   done
@@ -581,6 +713,7 @@ main() {
   bootstrap
   check_prerequisites
   setup_env
+  setup_license
   select_connectors_interactive
   # shellcheck source=/dev/null
   source "${ENV_FILE}" 2>/dev/null || true
@@ -588,6 +721,8 @@ main() {
   setup_tls
   setup_hosts
   pull_images
+  load_images
+  load_ollama_model
   check_connector_credentials
   start_services
   run_health_checks

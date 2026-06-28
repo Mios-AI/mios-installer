@@ -34,12 +34,31 @@ Connectors (Slack, GitHub, Microsoft 365, Google Workspace) are optional and req
 |------|-------------|
 | `--env-file PATH` | Skip interactive setup, use an existing `.env` file |
 | `--with-connectors` | Start all connectors without the interactive selection prompt |
-| `--skip-pull` | Skip image pull (air-gapped environments) |
+| `--skip-pull` | Skip image pull (images already loaded locally) |
+| `--airgap` | Fully offline: load images + Ollama model from the bundle, no network |
+| `--bundle DIR` | Directory holding the air-gap bundle (default: install dir) |
 
 ```bash
 # Example: non-interactive install with all connectors
 ./install.sh --env-file /path/to/.env --with-connectors
 ```
+
+## Air-gapped install (no internet on the target)
+
+The release ships a bundle: `mios-<version>-images.tar.gz.part*` (all container
+images, split into <2 GB parts) and `mios-<version>-ollama-<model>.tar.gz.part*`
+(the pre-pulled Ollama model).
+
+```bash
+# 1. Copy the release files + every *.part* to the target host (same folder).
+# 2. Configure your environment:
+cp .env.example .env        # then set DOMAIN_NAME and secrets
+# 3. Install fully offline:
+./install.sh --airgap --env-file .env
+```
+
+`--airgap` runs `docker load` on the image parts, restores the Ollama model into
+the `mios_ollama_models` volume, and starts the stack without any network access.
 
 ## After install
 
