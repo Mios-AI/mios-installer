@@ -2,9 +2,9 @@
 # MIOS On-Premise Installer
 #
 # Usage:
-#   ./install.sh                         # interactive setup
+#   ./install.sh                         # interactive setup (prompts for domain + connectors)
 #   ./install.sh --env-file /path/.env   # non-interactive with existing env file
-#   ./install.sh --with-connectors       # also start optional connector services
+#   ./install.sh --with-connectors       # start all connectors without interactive prompt
 #   ./install.sh --skip-pull             # skip docker image pull (air-gapped)
 #   ./install.sh --help
 
@@ -25,6 +25,13 @@ readonly HEALTH_TIMEOUT=120
 OPT_ENV_FILE=""
 OPT_WITH_CONNECTORS=false
 OPT_SKIP_PULL=false
+OPT_AIRGAP=false
+OPT_BUNDLE_DIR=""
+
+# ─── Connector state ──────────────────────────────────────────────────────────
+SELECTED_CONNECTORS=()
+CONNECTORS_TO_START=()
+readonly AVAILABLE_CONNECTORS=("slack" "github" "microsoft" "google")
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -60,9 +67,14 @@ Usage: $(basename "$0") [OPTIONS]
 
 Options:
   --env-file PATH      Use an existing .env file instead of the interactive setup
-  --with-connectors    Also start Slack, GitHub, Microsoft and Google connectors
+  --with-connectors    Start all connectors without interactive selection prompt
   --skip-pull          Skip docker image pull (for air-gapped environments)
+  --airgap             Fully offline install: load images + Ollama model from the
+                       bundle and skip all network pulls (implies --skip-pull)
+  --bundle DIR         Directory holding the air-gap bundle (default: install dir)
   --help               Show this help message
+
+Connector setup guide: https://docs.mios-ai.com/docs/on-premise/connectors
 EOF
   exit 0
 }
@@ -72,6 +84,8 @@ while [[ $# -gt 0 ]]; do
     --env-file)        OPT_ENV_FILE="$2"; shift 2 ;;
     --with-connectors) OPT_WITH_CONNECTORS=true; shift ;;
     --skip-pull)       OPT_SKIP_PULL=true; shift ;;
+    --airgap)          OPT_AIRGAP=true; OPT_SKIP_PULL=true; shift ;;
+    --bundle)          OPT_BUNDLE_DIR="$2"; shift 2 ;;
     --help|-h)         usage ;;
     *) error "Unknown option: $1. Use --help for usage." ;;
   esac
@@ -164,7 +178,7 @@ setup_env() {
   # ── Interactive prompts ──
   read_input() {
     local prompt="$1" default="$2" value
-    read -rp "   ${prompt} [${default}]: " value
+    read -rp "   ${prompt} [${default}]: " value </dev/tty
     echo "${value:-$default}"
   }
 
@@ -196,6 +210,10 @@ setup_env() {
     sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=$(generate_secret)|" "${ENV_FILE}"
     sed -i "s|^MINIO_ROOT_PASSWORD=.*|MINIO_ROOT_PASSWORD=$(generate_secret)|" "${ENV_FILE}"
     sed -i "s|^INTERNAL_API_KEY=.*|INTERNAL_API_KEY=$(generate_secret)|" "${ENV_FILE}"
+    sed -i "s|^KEYCLOAK_ADMIN_PASSWORD=.*|KEYCLOAK_ADMIN_PASSWORD=$(generate_secret)|" "${ENV_FILE}"
+    sed -i "s|^KEYCLOAK_DB_PASSWORD=.*|KEYCLOAK_DB_PASSWORD=$(generate_secret)|" "${ENV_FILE}"
+    sed -i "s|^KEYCLOAK_CLIENT_SECRET=.*|KEYCLOAK_CLIENT_SECRET=$(generate_secret)|" "${ENV_FILE}"
+    sed -i "s|^NEXTAUTH_SECRET=.*|NEXTAUTH_SECRET=$(generate_secret)|" "${ENV_FILE}"
     success "Secrets generated"
   fi
 
@@ -203,6 +221,162 @@ setup_env() {
   sed -i "s|\${DOMAIN_NAME}|${domain}|g" "${ENV_FILE}"
 
   success ".env created at ${ENV_FILE}"
+}
+
+# ─── License setup ────────────────────────────────────────────────────────────
+readonly LICENSE_DIR="${SCRIPT_DIR}/license"
+readonly LICENSE_FILE="${LICENSE_DIR}/mios.license"
+
+generate_instance_id() {
+  uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16
+}
+
+setup_license() {
+  step "License setup"
+  mkdir -p "${LICENSE_DIR}"
+
+  # Instance ID — generated once, ties the license to this installation.
+  if ! grep -q "^MIOS_INSTANCE_ID=.\+" "${ENV_FILE}" 2>/dev/null; then
+    local instance_id
+    instance_id=$(generate_instance_id)
+    if grep -q "^MIOS_INSTANCE_ID=" "${ENV_FILE}" 2>/dev/null; then
+      sed -i "s|^MIOS_INSTANCE_ID=.*|MIOS_INSTANCE_ID=${instance_id}|" "${ENV_FILE}"
+    else
+      printf '\n# Unique installation ID — required to issue your Mios license\nMIOS_INSTANCE_ID=%s\n' "${instance_id}" >> "${ENV_FILE}"
+    fi
+    success "Instance ID generated: ${instance_id}"
+  fi
+
+  if [ -f "${LICENSE_FILE}" ]; then
+    success "License file found: ${LICENSE_FILE}"
+  else
+    local instance_id
+    instance_id=$(grep "^MIOS_INSTANCE_ID=" "${ENV_FILE}" | cut -d= -f2)
+    warn "No license file found at ${LICENSE_FILE}"
+    echo -e "   Send this instance ID to your Mios contact to receive your license:" >&2
+    echo -e "   ${BOLD}${instance_id}${RESET}" >&2
+    echo -e "   Then place the received file at ./license/mios.license (picked up within 60s)." >&2
+    echo -e "   Until then the API stays locked (only /health and /license respond)." >&2
+  fi
+}
+
+# ─── Connector selection ──────────────────────────────────────────────────────
+select_connectors_interactive() {
+  # --with-connectors flag: select all without showing UI
+  if [ "${OPT_WITH_CONNECTORS}" = true ]; then
+    for c in "${AVAILABLE_CONNECTORS[@]}"; do
+      SELECTED_CONNECTORS+=("app-conn-${c}")
+    done
+    success "All connectors selected"
+    return
+  fi
+
+  # --env-file mode: no interactive prompt
+  if [ -n "${OPT_ENV_FILE}" ]; then
+    return
+  fi
+
+  local selected=()
+  for i in "${!AVAILABLE_CONNECTORS[@]}"; do selected[i]=0; done
+  local cursor=0
+
+  trap "tput cnorm 2>/dev/null >&2; echo >&2; exit 130" SIGINT
+
+  tput civis 2>/dev/null >&2 || true
+
+  _draw_connector_menu() {
+    clear >&2
+    echo -e "${BOLD}Select connectors to install:${RESET}" >&2
+    echo -e "   ${BLUE}Space${RESET} to toggle · ${BLUE}↑ ↓${RESET} to move · ${BLUE}Enter${RESET} to confirm\n" >&2
+    for i in "${!AVAILABLE_CONNECTORS[@]}"; do
+      local prefix="  " ul=""
+      [ "$i" -eq "$cursor" ] && prefix="${BOLD}>${RESET} " && ul="\033[4m"
+      if [ "${selected[i]}" -eq 1 ]; then
+        echo -e "${prefix}${GREEN}${ul}[x] ${AVAILABLE_CONNECTORS[i]}${RESET}" >&2
+      else
+        echo -e "${prefix}${ul}[ ] ${AVAILABLE_CONNECTORS[i]}${RESET}" >&2
+      fi
+    done
+    echo >&2
+    echo -e "   ${YELLOW}Note:${RESET} Connectors require OAuth credentials in .env before connecting." >&2
+    echo -e "   Setup guide: https://docs.mios-ai.com/docs/on-premise/connectors" >&2
+  }
+
+  while true; do
+    _draw_connector_menu
+    IFS= read -rsn1 key </dev/tty
+    if [[ "$key" == $'\x1b' ]]; then
+      read -rsn2 -t 1 seq </dev/tty 2>/dev/null || true
+      case "$seq" in
+        "[A"|"OA") cursor=$(( cursor - 1 )); [ "$cursor" -lt 0 ] && cursor=$(( ${#AVAILABLE_CONNECTORS[@]} - 1 )) ;;
+        "[B"|"OB") cursor=$(( cursor + 1 )); [ "$cursor" -ge "${#AVAILABLE_CONNECTORS[@]}" ] && cursor=0 ;;
+      esac
+    elif [[ "$key" == " " ]]; then
+      selected[cursor]=$(( 1 - selected[cursor] ))
+    elif [[ "$key" == "" ]]; then
+      break
+    fi
+  done
+
+  tput cnorm 2>/dev/null >&2 || true
+  clear >&2
+  trap cleanup EXIT
+
+  for i in "${!AVAILABLE_CONNECTORS[@]}"; do
+    [ "${selected[i]}" -eq 1 ] && SELECTED_CONNECTORS+=("app-conn-${AVAILABLE_CONNECTORS[i]}")
+  done
+
+  if [ "${#SELECTED_CONNECTORS[@]}" -gt 0 ]; then
+    success "Selected connectors: $(IFS=', '; echo "${SELECTED_CONNECTORS[*]/#app-conn-/}")"
+  else
+    info "No connectors selected — rerun install.sh to add them later"
+  fi
+}
+
+# ─── Connector credential check ───────────────────────────────────────────────
+_connector_env_valid() {
+  local var
+  for var in "$@"; do
+    local val
+    val=$(grep "^${var}=" "${ENV_FILE}" 2>/dev/null | cut -d= -f2- | tr -d '"')
+    if [ -z "$val" ] || [[ "$val" == *"<CHANGE_ME>"* ]]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+_connector_doc_url() {
+  case "$1" in
+    slack)     echo "https://docs.mios-ai.com/docs/on-premise/connectors#slack" ;;
+    github)    echo "https://docs.mios-ai.com/docs/on-premise/connectors#github" ;;
+    microsoft) echo "https://docs.mios-ai.com/docs/on-premise/connectors#microsoft-365" ;;
+    google)    echo "https://docs.mios-ai.com/docs/on-premise/connectors#google-workspace" ;;
+  esac
+}
+
+check_connector_credentials() {
+  [ "${#SELECTED_CONNECTORS[@]}" -eq 0 ] && return
+
+  step "Checking connector credentials"
+  for c in "${SELECTED_CONNECTORS[@]}"; do
+    local name="${c#app-conn-}"
+    local ready=true
+    case "$name" in
+      slack)     _connector_env_valid SLACK_BOT_TOKEN SLACK_CLIENT_ID SLACK_CLIENT_SECRET SLACK_SIGNING_SECRET || ready=false ;;
+      github)    _connector_env_valid GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET || ready=false ;;
+      microsoft) _connector_env_valid MICROSOFT_CLIENT_ID MICROSOFT_CLIENT_SECRET || ready=false ;;
+      google)    _connector_env_valid GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET || ready=false ;;
+    esac
+
+    if [ "$ready" = true ]; then
+      success "${name}: credentials found — will start"
+      CONNECTORS_TO_START+=("$c")
+    else
+      warn "${name}: credentials missing in .env — skipping"
+      info "  Setup guide: $(_connector_doc_url "$name")"
+    fi
+  done
 }
 
 # ─── Hosts entries ────────────────────────────────────────────────────────────
@@ -258,10 +432,61 @@ pull_images() {
 
   step "Pulling Docker images"
   local compose_args=(-f "${COMPOSE_FILE}" --env-file "${ENV_FILE}")
-  [ "${OPT_WITH_CONNECTORS}" = true ] && compose_args+=(--profile connectors)
-
   docker compose "${compose_args[@]}" pull --quiet
+  if [ "${#SELECTED_CONNECTORS[@]}" -gt 0 ]; then
+    docker compose "${compose_args[@]}" pull --quiet "${SELECTED_CONNECTORS[@]}"
+  fi
   success "Images pulled"
+}
+
+# ─── Air-gapped image + model loading ─────────────────────────────────────────
+_bundle_dir() { echo "${OPT_BUNDLE_DIR:-${SCRIPT_DIR}}"; }
+
+load_images() {
+  [ "${OPT_AIRGAP}" = true ] || return
+
+  step "Loading container images from bundle (air-gapped)"
+  local dir; dir="$(_bundle_dir)"
+  shopt -s nullglob
+  local parts=("${dir}"/mios-*-images.tar.gz.part*)
+  local single=("${dir}"/mios-*-images.tar.gz)
+  shopt -u nullglob
+
+  if [ "${#parts[@]}" -gt 0 ]; then
+    info "Loading ${#parts[@]} image part(s) from ${dir}..."
+    cat "${parts[@]}" | docker load | sed 's/^/   /'
+  elif [ "${#single[@]}" -gt 0 ]; then
+    info "Loading $(basename "${single[0]}")..."
+    docker load -i "${single[0]}" | sed 's/^/   /'
+  else
+    error "No image bundle found in ${dir} (expected mios-*-images.tar.gz[.part*]). Use --bundle DIR."
+  fi
+  success "Images loaded into the local Docker engine"
+}
+
+load_ollama_model() {
+  [ "${OPT_AIRGAP}" = true ] || return
+
+  local dir; dir="$(_bundle_dir)"
+  shopt -s nullglob
+  local parts=("${dir}"/mios-*-ollama-*.tar.gz.part*)
+  local single=("${dir}"/mios-*-ollama-*.tar.gz)
+  shopt -u nullglob
+
+  if [ "${#parts[@]}" -eq 0 ] && [ "${#single[@]}" -eq 0 ]; then
+    warn "No Ollama model bundle found in ${dir} — local AI inference unavailable until a model is loaded."
+    return
+  fi
+
+  step "Restoring Ollama model into volume (air-gapped)"
+  docker volume create mios_ollama_models >/dev/null
+  # busybox ships in the image bundle and provides tar for the restore.
+  if [ "${#parts[@]}" -gt 0 ]; then
+    cat "${parts[@]}" | docker run --rm -i -v mios_ollama_models:/data busybox tar -xzf - -C /data
+  else
+    docker run --rm -i -v mios_ollama_models:/data busybox tar -xzf - -C /data < "${single[0]}"
+  fi
+  success "Ollama model restored into mios_ollama_models"
 }
 
 # ─── Database migrations ──────────────────────────────────────────────────────
@@ -280,9 +505,10 @@ run_migrations() {
 start_services() {
   step "Starting services"
   local compose_args=(-f "${COMPOSE_FILE}" --env-file "${ENV_FILE}")
-  [ "${OPT_WITH_CONNECTORS}" = true ] && compose_args+=(--profile connectors)
-
   docker compose "${compose_args[@]}" up -d --remove-orphans
+  if [ "${#CONNECTORS_TO_START[@]}" -gt 0 ]; then
+    docker compose "${compose_args[@]}" up -d "${CONNECTORS_TO_START[@]}"
+  fi
   success "Services started"
 }
 
@@ -314,6 +540,70 @@ run_health_checks() {
   wait_healthy "Frontend app" "https://app.${domain}"        || true
   wait_healthy "AI service"   "https://ai.${domain}/health"  || true
   wait_healthy "Chatbot"      "https://chatbot.${domain}/health" || true
+  for c in "${CONNECTORS_TO_START[@]}"; do
+    local name="${c#app-conn-}"
+    local container="mios-${c}"
+    printf "   Waiting for %-25s" "${name} connector..."
+    local elapsed=0
+    until docker exec "${container}" bun -e "fetch('http://localhost:3000/health').then(r=>r.ok||process.exit(1)).catch(()=>process.exit(1))" > /dev/null 2>&1; do
+      if [ "${elapsed}" -ge "${HEALTH_TIMEOUT}" ]; then
+        echo -e " ${RED}TIMEOUT${RESET}"
+        warn "${name} connector did not become healthy within ${HEALTH_TIMEOUT}s"
+        break
+      fi
+      sleep 3
+      elapsed=$((elapsed + 3))
+      printf "."
+    done
+    [ "${elapsed}" -lt "${HEALTH_TIMEOUT}" ] && echo -e " ${GREEN}OK${RESET}" || true
+  done
+}
+
+# ─── Trust certificate ────────────────────────────────────────────────────────
+trust_certificate() {
+  local cert="${SCRIPT_DIR}/certs/cert.pem"
+  [ -f "${cert}" ] || return
+
+  # Only offer for self-signed certs (issuer == subject)
+  local subject issuer
+  subject=$(openssl x509 -in "${cert}" -noout -subject 2>/dev/null | sed 's/subject=//')
+  issuer=$(openssl x509 -in "${cert}" -noout -issuer 2>/dev/null | sed 's/issuer=//')
+  [ "${subject}" = "${issuer}" ] || return
+
+  echo
+  local answer
+  read -rp "   Install self-signed certificate into system trust store? [y/N] " answer </dev/tty
+  answer="${answer:-N}"
+  [[ "${answer}" =~ ^[Yy]$ ]] || return
+
+  step "Installing certificate"
+
+  if command -v update-ca-trust &>/dev/null; then
+    sudo cp "${cert}" /etc/pki/ca-trust/source/anchors/mios-local.pem
+    sudo update-ca-trust
+    success "Certificate added to system trust store (Fedora/RHEL)"
+  elif command -v update-ca-certificates &>/dev/null; then
+    sudo cp "${cert}" /usr/local/share/ca-certificates/mios-local.crt
+    sudo update-ca-certificates
+    success "Certificate added to system trust store (Debian/Ubuntu)"
+  elif [[ "$(uname)" == "Darwin" ]]; then
+    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "${cert}"
+    success "Certificate added to macOS Keychain"
+  else
+    warn "Unknown OS — add ${cert} manually to your trust store."
+    return
+  fi
+
+  # Also import into Firefox if certutil is available
+  if command -v certutil &>/dev/null; then
+    local added=false
+    while IFS= read -r db; do
+      certutil -A -n "mios-local" -t "CT,," -i "${cert}" -d "sql:${db}" 2>/dev/null && added=true
+    done < <(find "${HOME}/.mozilla/firefox" -name "cert9.db" -exec dirname {} \; 2>/dev/null)
+    [ "${added}" = true ] && success "Certificate also added to Firefox"
+  else
+    info "Install nss-tools (certutil) to also import into Firefox automatically."
+  fi
 }
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
@@ -330,10 +620,36 @@ print_summary() {
   echo -e "  ${BOLD}API${RESET}          → https://api.${domain}"
   echo -e "  ${BOLD}AI service${RESET}   → https://ai.${domain}"
   echo -e "  ${BOLD}Storage${RESET}      → https://minio.${domain}"
+  if [ "${#CONNECTORS_TO_START[@]}" -gt 0 ]; then
+    echo
+    echo -e "  ${BOLD}Connectors${RESET}"
+    for c in "${CONNECTORS_TO_START[@]}"; do
+      local name="${c#app-conn-}"
+      echo -e "    ${name}      → https://${name}.${domain}"
+    done
+  fi
+  local pending=()
+  for c in "${SELECTED_CONNECTORS[@]}"; do
+    local found=false
+    for s in "${CONNECTORS_TO_START[@]}"; do [ "$c" = "$s" ] && found=true && break; done
+    [ "$found" = false ] && pending+=("${c#app-conn-}")
+  done
+  if [ "${#pending[@]}" -gt 0 ]; then
+    echo
+    echo -e "  ${YELLOW}Connectors pending setup:${RESET}"
+    for name in "${pending[@]}"; do
+      echo -e "    ${name}  → fill credentials in .env then rerun ./install.sh"
+      echo -e "             $(_connector_doc_url "$name")"
+    done
+  fi
   echo
-  echo -e "  ${YELLOW}Note:${RESET} If you used a self-signed certificate, add ./certs/cert.pem"
-  echo -e "        to your system's trusted certificate store."
-  echo
+  if [ ! -f "${LICENSE_FILE}" ]; then
+    local instance_id
+    instance_id=$(grep "^MIOS_INSTANCE_ID=" "${ENV_FILE}" | cut -d= -f2 || true)
+    echo -e "  ${YELLOW}License missing — the API is locked until ./license/mios.license is installed.${RESET}"
+    echo -e "  Instance ID to send to Mios: ${BOLD}${instance_id}${RESET}"
+    echo
+  fi
   echo -e "  Logs:    docker compose -f docker-compose.onprem.yml logs -f"
   echo -e "  Upgrade: ./upgrade.sh"
   echo
@@ -341,10 +657,14 @@ print_summary() {
 
 # ─── Bootstrap — download required files if missing (curl | bash mode) ───────
 bootstrap() {
+  # Air-gapped installs ship every file in the bundle — never reach out to GitHub.
+  [ "${OPT_AIRGAP}" = true ] && return
   local files=(
     "docker-compose.onprem.yml"
     "traefik/dynamic/tls.yml"
     "traefik/dynamic/middlewares.yml"
+    "keycloak/realm-export.prod.json"
+    "keycloak/entrypoint.sh"
     ".env.example"
   )
   local missing=false
@@ -354,7 +674,7 @@ bootstrap() {
   [[ "$missing" == "false" ]] && return
 
   step "Downloading installer files..."
-  mkdir -p "${SCRIPT_DIR}/traefik/dynamic"
+  mkdir -p "${SCRIPT_DIR}/traefik/dynamic" "${SCRIPT_DIR}/keycloak"
   for f in "${files[@]}"; do
     curl -fsSL "${INSTALLER_URL}/${f}" -o "${SCRIPT_DIR}/${f}"
   done
@@ -370,14 +690,20 @@ main() {
   bootstrap
   check_prerequisites
   setup_env
+  setup_license
+  select_connectors_interactive
   # shellcheck source=/dev/null
   source "${ENV_FILE}" 2>/dev/null || true
   check_ports
   setup_tls
   setup_hosts
   pull_images
+  load_images
+  load_ollama_model
+  check_connector_credentials
   start_services
   run_health_checks
+  trust_certificate
   print_summary
 }
 
