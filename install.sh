@@ -585,19 +585,19 @@ run_health_checks() {
 # ─── Trust certificate ────────────────────────────────────────────────────────
 trust_certificate() {
   local cert="${SCRIPT_DIR}/certs/cert.pem"
-  [ -f "${cert}" ] || return
+  [ -f "${cert}" ] || return 0
 
   # Only offer for self-signed certs (issuer == subject)
   local subject issuer
   subject=$(openssl x509 -in "${cert}" -noout -subject 2>/dev/null | sed 's/subject=//')
   issuer=$(openssl x509 -in "${cert}" -noout -issuer 2>/dev/null | sed 's/issuer=//')
-  [ "${subject}" = "${issuer}" ] || return
+  [ "${subject}" = "${issuer}" ] || return 0
 
   echo
   local answer
   read -rp "   Install self-signed certificate into system trust store? [y/N] " answer </dev/tty
   answer="${answer:-N}"
-  [[ "${answer}" =~ ^[Yy]$ ]] || return
+  [[ "${answer}" =~ ^[Yy]$ ]] || return 0
 
   step "Installing certificate"
 
@@ -623,10 +623,13 @@ trust_certificate() {
     while IFS= read -r db; do
       certutil -A -n "mios-local" -t "CT,," -i "${cert}" -d "sql:${db}" 2>/dev/null && added=true
     done < <(find "${HOME}/.mozilla/firefox" -name "cert9.db" -exec dirname {} \; 2>/dev/null)
-    [ "${added}" = true ] && success "Certificate also added to Firefox"
+    if [ "${added}" = true ]; then
+      success "Certificate also added to Firefox"
+    fi
   else
     info "Install nss-tools (certutil) to also import into Firefox automatically."
   fi
+  return 0
 }
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
