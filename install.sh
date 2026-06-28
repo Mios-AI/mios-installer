@@ -443,7 +443,7 @@ pull_images() {
 _bundle_dir() { echo "${OPT_BUNDLE_DIR:-${SCRIPT_DIR}}"; }
 
 load_images() {
-  [ "${OPT_AIRGAP}" = true ] || return
+  [ "${OPT_AIRGAP}" = true ] || return 0
 
   step "Loading container images from bundle (air-gapped)"
   local dir; dir="$(_bundle_dir)"
@@ -465,7 +465,7 @@ load_images() {
 }
 
 load_ollama_model() {
-  [ "${OPT_AIRGAP}" = true ] || return
+  [ "${OPT_AIRGAP}" = true ] || return 0
 
   local dir; dir="$(_bundle_dir)"
   shopt -s nullglob
@@ -505,6 +505,7 @@ run_migrations() {
 start_services() {
   step "Starting services"
   local compose_args=(-f "${COMPOSE_FILE}" --env-file "${ENV_FILE}")
+  [ "${OPT_AIRGAP}" = true ] && export MIOS_PULL_POLICY=never
   docker compose "${compose_args[@]}" up -d --remove-orphans
   if [ "${#CONNECTORS_TO_START[@]}" -gt 0 ]; then
     docker compose "${compose_args[@]}" up -d "${CONNECTORS_TO_START[@]}"
@@ -531,15 +532,37 @@ wait_healthy() {
   echo -e " ${GREEN}OK${RESET}"
 }
 
+wait_ai() {
+  local url="$1" elapsed=0 ai_model
+  ai_model=$(grep "^AI_MODEL=" "${ENV_FILE}" | cut -d= -f2 | tr -d '"' || true)
+
+  printf "   Waiting for %-25s" "AI service..."
+  until curl -sfk --max-time 3 "${url}" > /dev/null 2>&1; do
+    if [ "${elapsed}" -ge "${HEALTH_TIMEOUT}" ]; then
+      echo -e " ${YELLOW}preparing${RESET}"
+      info "On first boot the AI service downloads its model${ai_model:+ (${ai_model})}; this can take several minutes and continues in the background."
+      info "Follow it with: docker compose -f docker-compose.onprem.yml logs -f app-ai"
+      return 0
+    fi
+    sleep 3
+    elapsed=$((elapsed + 3))
+    printf "."
+  done
+  echo -e " ${GREEN}OK${RESET}"
+}
+
 run_health_checks() {
   step "Health checks"
   local domain
   domain=$(grep "^DOMAIN_NAME=" "${ENV_FILE}" | cut -d= -f2 | tr -d '"' || echo "mios.local")
+  local https_port port_suffix=""
+  https_port=$(grep "^HTTPS_PORT=" "${ENV_FILE}" | cut -d= -f2 | tr -d '"')
+  [ -n "${https_port}" ] && [ "${https_port}" != "443" ] && port_suffix=":${https_port}"
 
-  wait_healthy "API backend"  "https://api.${domain}/health" || true
-  wait_healthy "Frontend app" "https://app.${domain}"        || true
-  wait_healthy "AI service"   "https://ai.${domain}/health"  || true
-  wait_healthy "Chatbot"      "https://chatbot.${domain}/health" || true
+  wait_healthy "API backend"  "https://api.${domain}${port_suffix}/health" || true
+  wait_healthy "Frontend app" "https://app.${domain}${port_suffix}"        || true
+  wait_ai      "https://ai.${domain}${port_suffix}/health"                 || true
+  wait_healthy "Chatbot"      "https://chatbot.${domain}${port_suffix}/health" || true
   for c in "${CONNECTORS_TO_START[@]}"; do
     local name="${c#app-conn-}"
     local container="mios-${c}"

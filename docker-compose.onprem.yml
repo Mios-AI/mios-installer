@@ -189,7 +189,7 @@ services:
   prisma-migrate:
     image: ${IMAGE_REGISTRY}/mios-app-back:${IMAGE_TAG:-latest}
     container_name: mios-prisma-migrate
-    pull_policy: always
+    pull_policy: ${MIOS_PULL_POLICY:-always}
     env_file: .env
     entrypoint: ["bunx", "prisma", "migrate", "deploy"]
     depends_on:
@@ -203,7 +203,7 @@ services:
     image: ${IMAGE_REGISTRY}/mios-app-back:${IMAGE_TAG:-latest}
     container_name: mios-app-back
     <<: *defaults
-    pull_policy: always
+    pull_policy: ${MIOS_PULL_POLICY:-always}
     env_file: .env
     environment:
       PORT: ${BACK_CONTAINER_PORT:-3000}
@@ -239,7 +239,7 @@ services:
     image: ${IMAGE_REGISTRY}/mios-app-ai:${IMAGE_TAG:-latest}
     container_name: mios-app-ai
     <<: *defaults
-    pull_policy: always
+    pull_policy: ${MIOS_PULL_POLICY:-always}
     env_file: .env
     environment:
       PORT: ${AI_CONTAINER_PORT:-8000}
@@ -271,7 +271,7 @@ services:
     image: ${IMAGE_REGISTRY}/mios-app-ai:${IMAGE_TAG:-latest}
     container_name: mios-app-ai-worker
     <<: *defaults
-    pull_policy: always
+    pull_policy: ${MIOS_PULL_POLICY:-always}
     env_file: .env
     command: ["python", "-m", "app.worker"]
     environment:
@@ -292,7 +292,7 @@ services:
     image: ${IMAGE_REGISTRY}/mios-app-front:${IMAGE_TAG:-latest}
     container_name: mios-app-front
     <<: *defaults
-    pull_policy: always
+    pull_policy: ${MIOS_PULL_POLICY:-always}
     env_file: .env
     depends_on:
       app-back:
@@ -316,7 +316,7 @@ services:
     image: ${IMAGE_REGISTRY}/mios-app-chatbot:${IMAGE_TAG:-latest}
     container_name: mios-app-chatbot
     <<: *defaults
-    pull_policy: always
+    pull_policy: ${MIOS_PULL_POLICY:-always}
     env_file: .env
     environment:
       PORT: 8080
@@ -344,7 +344,7 @@ services:
     image: ${IMAGE_REGISTRY}/mios-connector-slack:${IMAGE_TAG:-latest}
     container_name: mios-app-conn-slack
     <<: *defaults
-    pull_policy: always
+    pull_policy: ${MIOS_PULL_POLICY:-always}
     profiles: [connectors]
     env_file: .env
     environment:
@@ -367,7 +367,7 @@ services:
     image: ${IMAGE_REGISTRY}/mios-connector-github:${IMAGE_TAG:-latest}
     container_name: mios-app-conn-github
     <<: *defaults
-    pull_policy: always
+    pull_policy: ${MIOS_PULL_POLICY:-always}
     profiles: [connectors]
     env_file: .env
     environment:
@@ -390,7 +390,7 @@ services:
     image: ${IMAGE_REGISTRY}/mios-connector-microsoft:${IMAGE_TAG:-latest}
     container_name: mios-app-conn-microsoft
     <<: *defaults
-    pull_policy: always
+    pull_policy: ${MIOS_PULL_POLICY:-always}
     profiles: [connectors]
     env_file: .env
     environment:
@@ -413,7 +413,7 @@ services:
     image: ${IMAGE_REGISTRY}/mios-connector-google:${IMAGE_TAG:-latest}
     container_name: mios-app-conn-google
     <<: *defaults
-    pull_policy: always
+    pull_policy: ${MIOS_PULL_POLICY:-always}
     profiles: [connectors]
     env_file: .env
     environment:
@@ -453,22 +453,23 @@ services:
     image: quay.io/keycloak/keycloak:26.0
     container_name: mios-keycloak
     entrypoint: ["/opt/keycloak/entrypoint.sh"]
-    command: ["start", "--optimized", "--import-realm"]
+    command: ["start", "--import-realm"]
     environment:
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://db-keycloak:5432/${KEYCLOAK_DB_NAME}
       KC_DB_USERNAME: ${KEYCLOAK_DB_USER}
       KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
-      KC_HOSTNAME_URL: https://auth.${DOMAIN_NAME}
-      KC_HOSTNAME_ADMIN_URL: https://auth.${DOMAIN_NAME}
+      KC_HOSTNAME: https://auth.${DOMAIN_NAME}
+      KC_HOSTNAME_ADMIN: https://auth.${DOMAIN_NAME}
       KC_PROXY_HEADERS: xforwarded
       KC_HTTP_ENABLED: "true"
       KC_HEALTH_ENABLED: "true"
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
       KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET}
+      DOMAIN_NAME: ${DOMAIN_NAME}
     volumes:
-      - ./keycloak/realm-export.prod.json:/opt/keycloak/data/import/realm-export.tpl.json:ro,z
+      - ./keycloak/realm-export.prod.json:/opt/keycloak/realm-export.tpl.json:ro,z
       - ./keycloak/entrypoint.sh:/opt/keycloak/entrypoint.sh:ro,z
     depends_on:
       db-keycloak:
