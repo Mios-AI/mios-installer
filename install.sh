@@ -257,7 +257,7 @@ setup_license() {
     warn "No license file found at ${LICENSE_FILE}"
     echo -e "   Send this instance ID to your Mios contact to receive your license:" >&2
     echo -e "   ${BOLD}${instance_id}${RESET}" >&2
-    echo -e "   Then place the received file at ./license/mios.license (picked up within 60s)." >&2
+    echo -e "   Then install it with: ./setup-license.sh <file>  (or drop it at ./license/mios.license)." >&2
     echo -e "   Until then the API stays locked (only /health and /license respond)." >&2
   fi
 }
@@ -728,6 +728,7 @@ print_summary() {
     instance_id=$(grep "^MIOS_INSTANCE_ID=" "${ENV_FILE}" | cut -d= -f2 || true)
     echo -e "  ${YELLOW}License missing — the API is locked until ./license/mios.license is installed.${RESET}"
     echo -e "  Instance ID to send to Mios: ${BOLD}${instance_id}${RESET}"
+    echo -e "  Once you receive your license: ${BOLD}./setup-license.sh <file>${RESET}"
     echo
   fi
   echo -e "  Logs:    docker compose -f docker-compose.onprem.yml logs -f"
@@ -746,6 +747,7 @@ bootstrap() {
     "keycloak/realm-export.prod.json"
     "keycloak/entrypoint.sh"
     ".env.example"
+    "setup-license.sh"
   )
   local missing=false
   for f in "${files[@]}"; do
@@ -758,7 +760,7 @@ bootstrap() {
   for f in "${files[@]}"; do
     curl -fsSL "${INSTALLER_URL}/${f}" -o "${SCRIPT_DIR}/${f}"
   done
-  chmod +x "${SCRIPT_DIR}/keycloak/entrypoint.sh"
+  chmod +x "${SCRIPT_DIR}/keycloak/entrypoint.sh" "${SCRIPT_DIR}/setup-license.sh"
   success "Installer files ready"
 }
 
