@@ -40,7 +40,9 @@ fi
 
 mkdir -p "${LICENSE_DIR}"
 cp "${SRC}" "${LICENSE_FILE}"
-chmod 600 "${LICENSE_FILE}"
+# The license is signed public data (no secret) — keep it readable by the
+# container user, whose uid may differ from the host installer's.
+chmod 644 "${LICENSE_FILE}"
 success "License installed at ${LICENSE_FILE}"
 
 # Trigger an immediate reload (best-effort; otherwise picked up within ~60s).

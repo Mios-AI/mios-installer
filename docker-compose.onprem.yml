@@ -212,7 +212,7 @@ services:
       LICENSE_FILE_PATH: /app/license/mios.license
     # rw : POST /license (renouvellement depuis l'UI) écrit le nouveau fichier
     volumes:
-      - ./license:/app/license
+      - ./license:/app/license:z
     depends_on:
       db-back:
         condition: service_healthy
