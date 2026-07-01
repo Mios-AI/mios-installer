@@ -163,6 +163,7 @@ setup_env() {
       error "Provided env file not found: ${OPT_ENV_FILE}"
     fi
     cp "${OPT_ENV_FILE}" "${ENV_FILE}"
+    chmod 600 "${ENV_FILE}"
     success "Using env file: ${OPT_ENV_FILE}"
     return
   fi
@@ -174,6 +175,7 @@ setup_env() {
 
   step "Environment setup"
   cp "${ENV_EXAMPLE}" "${ENV_FILE}"
+  chmod 600 "${ENV_FILE}"
 
   # ── Interactive prompts ──
   read_input() {
@@ -258,6 +260,27 @@ setup_license() {
     echo -e "   Then place the received file at ./license/mios.license (picked up within 60s)." >&2
     echo -e "   Until then the API stays locked (only /health and /license respond)." >&2
   fi
+}
+
+# ─── Config validation ────────────────────────────────────────────────────────
+validate_env() {
+  step "Validating configuration"
+  local required=(DB_BACK_PASSWORD DB_AI_PASSWORD REDIS_PASSWORD MINIO_ROOT_PASSWORD \
+    INTERNAL_API_KEY KEYCLOAK_ADMIN_PASSWORD KEYCLOAK_DB_PASSWORD KEYCLOAK_CLIENT_SECRET \
+    NEXTAUTH_SECRET)
+  local missing=()
+  for var in "${required[@]}"; do
+    local val
+    val=$(grep "^${var}=" "${ENV_FILE}" 2>/dev/null | cut -d= -f2- | tr -d '"')
+    if [ -z "${val}" ] || [[ "${val}" == *"<CHANGE_ME>"* ]]; then
+      missing+=("${var}")
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    error "Required secrets are unset or still <CHANGE_ME> in ${ENV_FILE}: ${missing[*]}
+   Delete ${ENV_FILE} and rerun to auto-generate them, or fill them in (see .env.example)."
+  fi
+  success "Configuration complete"
 }
 
 # ─── Connector selection ──────────────────────────────────────────────────────
@@ -384,16 +407,21 @@ setup_hosts() {
   local domain
   domain=$(grep "^DOMAIN_NAME=" "${ENV_FILE}" | cut -d= -f2 | tr -d '"' || echo "mios.local")
 
-  local subdomains="app api ai minio chatbot slack github microsoft google"
+  local subdomains="app api ai auth minio chatbot slack github microsoft google"
   local hosts_line="127.0.0.1 ${domain}"
   for sub in ${subdomains}; do
     hosts_line="${hosts_line} ${sub}.${domain}"
   done
 
-  if ! grep -qF "${domain}" /etc/hosts 2>/dev/null; then
+  # Match the FULL line, not just the domain: a stale entry from a previous
+  # install (missing a newly added subdomain such as auth) must not suppress the
+  # updated line, otherwise that subdomain never resolves.
+  if ! grep -qxF "${hosts_line}" /etc/hosts 2>/dev/null; then
     step "Adding hosts entries for ${domain}"
     echo "${hosts_line}" | sudo tee -a /etc/hosts > /dev/null
     success "Hosts entries added"
+  else
+    success "Hosts entries already present for ${domain}"
   fi
 }
 
@@ -442,6 +470,24 @@ pull_images() {
 # ─── Air-gapped image + model loading ─────────────────────────────────────────
 _bundle_dir() { echo "${OPT_BUNDLE_DIR:-${SCRIPT_DIR}}"; }
 
+# Align IMAGE_REGISTRY / IMAGE_TAG in .env with the images actually loaded from
+# the bundle, so `docker compose up` (pull_policy=never) resolves them by their
+# real tag instead of the default `latest`, which the bundle never ships.
+align_image_ref() {
+  local load_out="$1" ref reg tag
+  ref=$(printf '%s\n' "${load_out}" | grep -oE '[^[:space:]]+/mios-app-back:[^[:space:]]+' | head -1)
+  if [ -z "${ref}" ]; then
+    warn "Could not detect the image tag from the bundle — leaving IMAGE_TAG/IMAGE_REGISTRY as-is."
+    warn "If startup fails with 'image not found', set IMAGE_TAG to the bundle version in .env."
+    return
+  fi
+  reg="${ref%/mios-app-back:*}"
+  tag="${ref##*:}"
+  sed -i "s|^IMAGE_REGISTRY=.*|IMAGE_REGISTRY=${reg}|" "${ENV_FILE}"
+  sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${tag}|" "${ENV_FILE}"
+  success "Image reference aligned to bundle: ${reg}/mios-*:${tag}"
+}
+
 load_images() {
   [ "${OPT_AIRGAP}" = true ] || return 0
 
@@ -452,16 +498,20 @@ load_images() {
   local single=("${dir}"/mios-*-images.tar.gz)
   shopt -u nullglob
 
+  local load_out
   if [ "${#parts[@]}" -gt 0 ]; then
     info "Loading ${#parts[@]} image part(s) from ${dir}..."
-    cat "${parts[@]}" | docker load | sed 's/^/   /'
+    load_out=$(cat "${parts[@]}" | docker load)
   elif [ "${#single[@]}" -gt 0 ]; then
     info "Loading $(basename "${single[0]}")..."
-    docker load -i "${single[0]}" | sed 's/^/   /'
+    load_out=$(docker load -i "${single[0]}")
   else
     error "No image bundle found in ${dir} (expected mios-*-images.tar.gz[.part*]). Use --bundle DIR."
   fi
+  printf '%s\n' "${load_out}" | sed 's/^/   /'
   success "Images loaded into the local Docker engine"
+
+  align_image_ref "${load_out}"
 }
 
 load_ollama_model() {
@@ -505,7 +555,7 @@ run_migrations() {
 start_services() {
   step "Starting services"
   local compose_args=(-f "${COMPOSE_FILE}" --env-file "${ENV_FILE}")
-  [ "${OPT_AIRGAP}" = true ] && export MIOS_PULL_POLICY=never
+  { [ "${OPT_AIRGAP}" = true ] || [ "${OPT_SKIP_PULL}" = true ]; } && export MIOS_PULL_POLICY=never
   docker compose "${compose_args[@]}" up -d --remove-orphans
   if [ "${#CONNECTORS_TO_START[@]}" -gt 0 ]; then
     docker compose "${compose_args[@]}" up -d "${CONNECTORS_TO_START[@]}"
@@ -559,10 +609,13 @@ run_health_checks() {
   https_port=$(grep "^HTTPS_PORT=" "${ENV_FILE}" | cut -d= -f2 | tr -d '"')
   [ -n "${https_port}" ] && [ "${https_port}" != "443" ] && port_suffix=":${https_port}"
 
+  local kc_realm
+  kc_realm=$(grep "^KEYCLOAK_REALM=" "${ENV_FILE}" | cut -d= -f2 | tr -d '"' || echo "mios")
   wait_healthy "API backend"  "https://api.${domain}${port_suffix}/health" || true
   wait_healthy "Frontend app" "https://app.${domain}${port_suffix}"        || true
   wait_ai      "https://ai.${domain}${port_suffix}/health"                 || true
   wait_healthy "Chatbot"      "https://chatbot.${domain}${port_suffix}/health" || true
+  wait_healthy "Identity (Keycloak)" "https://auth.${domain}${port_suffix}/realms/${kc_realm:-mios}" || true
   for c in "${CONNECTORS_TO_START[@]}"; do
     local name="${c#app-conn-}"
     local container="mios-${c}"
@@ -645,6 +698,7 @@ print_summary() {
   echo -e "  ${BOLD}Application${RESET}  → https://app.${domain}"
   echo -e "  ${BOLD}API${RESET}          → https://api.${domain}"
   echo -e "  ${BOLD}AI service${RESET}   → https://ai.${domain}"
+  echo -e "  ${BOLD}Identity${RESET}     → https://auth.${domain}"
   echo -e "  ${BOLD}Storage${RESET}      → https://minio.${domain}"
   if [ "${#CONNECTORS_TO_START[@]}" -gt 0 ]; then
     echo
@@ -718,6 +772,7 @@ main() {
   check_prerequisites
   setup_env
   setup_license
+  validate_env
   select_connectors_interactive
   # shellcheck source=/dev/null
   source "${ENV_FILE}" 2>/dev/null || true

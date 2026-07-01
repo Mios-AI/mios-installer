@@ -111,12 +111,16 @@ backup_database() {
   fi
 
   step "Backing up databases"
+  # Dumps contain all business data — keep them owner-only.
+  umask 077
   mkdir -p "${BACKUP_DIR}"
+  chmod 700 "${BACKUP_DIR}"
   local timestamp
   timestamp=$(date +%Y%m%d_%H%M%S)
 
   local backup_back="${BACKUP_DIR}/db-back_${timestamp}.sql.gz"
   local backup_ai="${BACKUP_DIR}/db-ai_${timestamp}.sql.gz"
+  local backup_kc="${BACKUP_DIR}/db-keycloak_${timestamp}.sql.gz"
 
   info "Backing up business database..."
   docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" \
@@ -131,6 +135,13 @@ backup_database() {
     pg_dump -U "${DB_AI_USER}" "${DB_AI_NAME}" \
     | gzip > "${backup_ai}"
   success "AI DB → ${backup_ai}"
+
+  info "Backing up identity database (Keycloak)..."
+  docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" \
+    exec -T db-keycloak \
+    pg_dump -U "${KEYCLOAK_DB_USER}" "${KEYCLOAK_DB_NAME}" \
+    | gzip > "${backup_kc}"
+  success "Identity DB → ${backup_kc}"
 
   # Prune backups older than 30 days
   find "${BACKUP_DIR}" -name "*.sql.gz" -mtime +30 -delete 2>/dev/null || true
@@ -173,13 +184,16 @@ run_health_checks() {
   step "Post-upgrade health checks"
   local domain
   domain=$(grep "^DOMAIN_NAME=" "${ENV_FILE}" | cut -d= -f2 | tr -d '"' || echo "mios.local")
+  local https_port port_suffix=""
+  https_port=$(grep "^HTTPS_PORT=" "${ENV_FILE}" | cut -d= -f2 | tr -d '"')
+  [ -n "${https_port}" ] && [ "${https_port}" != "443" ] && port_suffix=":${https_port}"
 
   local failed=0
   check_service() {
     local name="$1" url="$2"
     local elapsed=0
     printf "   Waiting for %-25s" "${name}..."
-    until curl -sf --max-time 3 "${url}" > /dev/null 2>&1; do
+    until curl -sfk --max-time 3 "${url}" > /dev/null 2>&1; do
       if [ "${elapsed}" -ge 90 ]; then
         echo -e " ${RED}FAILED${RESET}"
         failed=$((failed + 1))
@@ -190,9 +204,9 @@ run_health_checks() {
     echo -e " ${GREEN}OK${RESET}"
   }
 
-  check_service "API backend"  "https://api.${domain}/health"
-  check_service "Frontend app" "https://app.${domain}"
-  check_service "AI service"   "https://ai.${domain}/health"
+  check_service "API backend"  "https://api.${domain}${port_suffix}/health"
+  check_service "Frontend app" "https://app.${domain}${port_suffix}"
+  check_service "AI service"   "https://ai.${domain}${port_suffix}/health"
 
   if [ "${failed}" -gt 0 ]; then
     error "${failed} service(s) failed health checks — triggering rollback."

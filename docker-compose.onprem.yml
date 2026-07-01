@@ -486,7 +486,7 @@ services:
       - "traefik.docker.network=mios-backend"
       - "traefik.http.routers.keycloak.rule=Host(`auth.${DOMAIN_NAME}`)"
       - "traefik.http.routers.keycloak.entrypoints=websecure"
-      - "traefik.http.routers.keycloak.tls.certresolver=myresolver"
+      - "traefik.http.routers.keycloak.tls=true"
       - "traefik.http.services.keycloak.loadbalancer.server.port=8080"
 
 # ─── Networks ─────────────────────────────────────────────────────────────────
